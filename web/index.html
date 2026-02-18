@@ -1,0 +1,877 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Grand Theft HotWheels: Carpet City</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #000; }
+  canvas { display: block; }
+  #hud {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    pointer-events: none; font-family: 'Times New Roman', serif; font-size: 24px;
+  }
+  #score-display {
+    position: absolute; top: 10px; left: 10px; color: #fff;
+  }
+  #health-display {
+    position: absolute; top: 10px; left: 50%; transform: translateX(-50%); color: #0f0;
+  }
+  #stage-display {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    color: #fff; font-size: 32px; display: none;
+  }
+  #gameover-display {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    text-align: center; color: #fff; display: none;
+  }
+  #gameover-display .title { font-size: 48px; color: #f00; margin-bottom: 10px; }
+  #gameover-display .info { font-size: 24px; }
+  #minimap-border {
+    position: absolute; top: 0; right: 0; width: 33.33%; height: 33.33%;
+    border: 2px solid rgba(255,255,255,0.3); pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div id="score-display">SCORE: 0</div>
+  <div id="health-display">HEALTH: 100%</div>
+  <div id="stage-display">STAGE 1</div>
+  <div id="gameover-display">
+    <div class="title">GAME OVER</div>
+    <div class="info">
+      <div id="final-score">SCORE: 0</div>
+      <div style="margin-top:20px; font-size:18px;">Press R to restart</div>
+    </div>
+  </div>
+  <div id="minimap-border"></div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+
+// ============================================================
+// CONSTANTS (matching original C++ values)
+// ============================================================
+const PI = Math.PI;
+const BOUNDS = 50;
+const TICK_RATE = 1000 / 15; // 15 FPS game logic
+const PLAYER_SPEED = 1.35;
+const PLAYER_TURN_SPEED = 20.0;
+const POLICE_VELOCITY = 0.75;
+
+// ============================================================
+// GAME STATE
+// ============================================================
+let windowWidth = window.innerWidth;
+let windowHeight = window.innerHeight;
+let gameOver = false;
+let score = 0;
+let health = 100;
+let healthR = 0, healthG = 1;
+let stage = 0;
+let stageUp = false;
+let transition = 30;
+let targSize = 10;
+let keysPressed = {};
+
+// ============================================================
+// THREE.JS SETUP
+// ============================================================
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(windowWidth, windowHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.autoClear = false;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
+
+// Main camera — arcball following player
+const mainCamera = new THREE.PerspectiveCamera(45, windowWidth / windowHeight, 0.1, 1000);
+// Overhead camera for minimap
+const overheadCamera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
+
+// Lighting (matches original: light at (10,10,10), white diffuse, no ambient)
+const light = new THREE.DirectionalLight(0xffffff, 1.0);
+light.position.set(10, 10, 10);
+scene.add(light);
+const ambientLight = new THREE.AmbientLight(0x222222);
+scene.add(ambientLight);
+
+// ============================================================
+// TEXTURE LOADING
+// ============================================================
+const textureLoader = new THREE.TextureLoader();
+const texturePath = 'textures/';
+
+function loadTex(name) {
+  const tex = textureLoader.load(texturePath + name);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+// ============================================================
+// SKYBOX
+// ============================================================
+function createSkybox() {
+  const size = 400; // 200*2 to match the original's ±200
+  const materialArray = [
+    new THREE.MeshBasicMaterial({ map: loadTex('right.png'), side: THREE.BackSide }),
+    new THREE.MeshBasicMaterial({ map: loadTex('left.png'), side: THREE.BackSide }),
+    new THREE.MeshBasicMaterial({ map: loadTex('top.png'), side: THREE.BackSide }),
+    new THREE.MeshBasicMaterial({ map: loadTex('bottom.png'), side: THREE.BackSide }),
+    new THREE.MeshBasicMaterial({ map: loadTex('back.png'), side: THREE.BackSide }),
+    new THREE.MeshBasicMaterial({ map: loadTex('front.png'), side: THREE.BackSide }),
+  ];
+  const geo = new THREE.BoxGeometry(size, size, size);
+  const skybox = new THREE.Mesh(geo, materialArray);
+  scene.add(skybox);
+  return skybox;
+}
+const skybox = createSkybox();
+
+// ============================================================
+// GROUND PLANE
+// ============================================================
+function createGround() {
+  const tex = loadTex('carcarpetcity.png');
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  const geo = new THREE.PlaneGeometry(BOUNDS * 2, BOUNDS * 2);
+  const mat = new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide });
+  const ground = new THREE.Mesh(geo, mat);
+  ground.rotation.x = -PI / 2;
+  ground.position.y = 0;
+  scene.add(ground);
+  return ground;
+}
+const ground = createGround();
+
+// ============================================================
+// CAR GEOMETRY BUILDER
+// ============================================================
+// Builds the car body as a BufferGeometry from the original vertex data.
+// The original code draws geometry at absolute world positions; here we
+// build it in local space (relative to car center at origin).
+// In the original, the car center is (carX, carY, carZ) and vertices are
+// offset from that. We subtract the center so geometry is at origin.
+
+function buildCarBodyGeometry(s, bodyColor, hoodColor) {
+  // s = carSize
+  // Collect triangulated quads. Each quad → 2 triangles.
+  const positions = [];
+  const colors = [];
+
+  function pushVert(x, y, z, r, g, b) {
+    positions.push(x, y, z);
+    colors.push(r, g, b);
+  }
+
+  function quad(verts, r, g, b) {
+    // verts: [[x,y,z], [x,y,z], [x,y,z], [x,y,z]]
+    // Two triangles: 0-1-2, 0-2-3
+    pushVert(...verts[0], r, g, b); pushVert(...verts[1], r, g, b); pushVert(...verts[2], r, g, b);
+    pushVert(...verts[0], r, g, b); pushVert(...verts[2], r, g, b); pushVert(...verts[3], r, g, b);
+  }
+
+  function tri(v0, v1, v2, r, g, b) {
+    pushVert(...v0, r, g, b); pushVert(...v1, r, g, b); pushVert(...v2, r, g, b);
+  }
+
+  const br = bodyColor[0], bg = bodyColor[1], bb = bodyColor[2];
+  const wr = 0.6, wg = 0.8, wb = 1.0; // window color
+  const hr = hoodColor[0], hg = hoodColor[1], hb = hoodColor[2];
+
+  // Upper right side
+  quad([[0, s, -s/2], [0, 0, -s/2], [-s/2, 0, -s/2], [-s/2, s, -s/2]], br, bg, bb);
+  // Lower right side
+  quad([[1.5*s, s/2, -s/2], [1.5*s, 0, -s/2], [-s, 0, -s/2], [-s, s/2, -s/2]], br, bg, bb);
+  // Upper left side
+  quad([[0, s, s/2], [0, 0, s/2], [-s/2, 0, s/2], [-s/2, s, s/2]], br, bg, bb);
+  // Lower left side
+  quad([[1.5*s, s/2, s/2], [1.5*s, 0, s/2], [-s, 0, s/2], [-s, s/2, s/2]], br, bg, bb);
+  // Rear
+  quad([[-s, 0, s/2], [-s, 0, -s/2], [-s, s/2, -s/2], [-s, s/2, s/2]], br, bg, bb);
+  // Rear windshield
+  quad([[-s, s/2, s/2], [-s, s/2, -s/2], [-s/2, s, -s/2], [-s/2, s, s/2]], wr, wg, wb);
+  // Roof
+  quad([[-s/2, s, s/2], [-s/2, s, -s/2], [0, s, -s/2], [0, s, s/2]], br, bg, bb);
+  // Front windshield
+  quad([[0, s, s/2], [0, s, -s/2], [s/2, s/2, -s/2], [s/2, s/2, s/2]], wr, wg, wb);
+  // Hood
+  quad([[s/2, s/2, s/2], [s/2, s/2, -s/2], [1.5*s, s/2, -s/2], [1.5*s, s/2, s/2]], hr, hg, hb);
+  // Front
+  quad([[1.5*s, s/2, s/2], [1.5*s, s/2, -s/2], [1.5*s, 0, -s/2], [1.5*s, 0, s/2]], 0, 0, 0);
+
+  // Side windows (triangles)
+  // Right side windows
+  tri([0, s, -s/2], [s/2, s/2, -s/2], [0, s/2, -s/2], wr, wg, wb);
+  // Left side windows
+  tri([0, s, s/2], [s/2, s/2, s/2], [0, s/2, s/2], wr, wg, wb);
+  // Rear right window
+  tri([-s, s/2, -s/2], [-s/2, s, -s/2], [-s/2, s/2, -s/2], wr, wg, wb);
+  // Rear left window
+  tri([-s, s/2, s/2], [-s/2, s, s/2], [-s/2, s/2, s/2], wr, wg, wb);
+
+  // Spoiler
+  quad([[-s, s/2, s/2], [-s, s/2, -s/2], [-1.2*s, s/1.5, -s/2], [-1.2*s, s/1.5, s/2]], 0, 0, 0);
+
+  // Bottom faces to close the car shape
+  // Bottom
+  quad([[-s, 0, -s/2], [-s, 0, s/2], [1.5*s, 0, s/2], [1.5*s, 0, -s/2]], br, bg, bb);
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function createWheel(s) {
+  const group = new THREE.Group();
+
+  // Tire (torus)
+  const tireGeo = new THREE.TorusGeometry(s / 4, s / 8, 8, 8);
+  const tireMat = new THREE.MeshLambertMaterial({ color: 0x000000 });
+  const tire = new THREE.Mesh(tireGeo, tireMat);
+  tire.rotation.y = PI / 2;
+  group.add(tire);
+
+  // Hubcap (disk)
+  const hubGeo = new THREE.CircleGeometry(s / 8, 32);
+  const hubMat = new THREE.MeshBasicMaterial({ color: 0xcccccc, side: THREE.DoubleSide });
+  const hub = new THREE.Mesh(hubGeo, hubMat);
+  hub.rotation.y = PI / 2;
+  hub.position.z = 0.01;
+  group.add(hub);
+
+  // Cross lines on hubcap (thin boxes)
+  const lineMat = new THREE.MeshBasicMaterial({ color: 0x000000 });
+  const lineGeo1 = new THREE.PlaneGeometry(s / 4, s / 32);
+  const line1 = new THREE.Mesh(lineGeo1, lineMat);
+  line1.rotation.y = PI / 2;
+  line1.rotation.x = PI / 4;
+  line1.position.z = 0.02;
+  group.add(line1);
+  const lineGeo2 = new THREE.PlaneGeometry(s / 4, s / 32);
+  const line2 = new THREE.Mesh(lineGeo2, lineMat);
+  line2.rotation.y = PI / 2;
+  line2.rotation.x = -PI / 4;
+  line2.position.z = 0.02;
+  group.add(line2);
+
+  return group;
+}
+
+// ============================================================
+// PORSCHE 944
+// ============================================================
+function createPorsche(x, y, z, theta, s) {
+  const group = new THREE.Group();
+
+  // Body
+  const bodyGeo = buildCarBodyGeometry(s, [0.6, 0.0, 0.0], [0.6, 0.0, 0.0]);
+  const bodyMat = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide });
+  const body = new THREE.Mesh(bodyGeo, bodyMat);
+  group.add(body);
+
+  // Wheels
+  // Rear-left
+  const wRL = createWheel(s);
+  wRL.position.set(-s / 2, 0, s / 1.9);
+  group.add(wRL);
+  // Rear-right
+  const wRR = createWheel(s);
+  wRR.position.set(-s / 2, 0, -s / 1.9);
+  wRR.rotation.y = PI;
+  group.add(wRR);
+  // Front-left
+  const wFL = createWheel(s);
+  wFL.position.set(s / 1.5, 0, s / 1.9);
+  group.add(wFL);
+  // Front-right
+  const wFR = createWheel(s);
+  wFR.position.set(s / 1.5, 0, -s / 1.9);
+  wFR.rotation.y = PI;
+  group.add(wFR);
+
+  group.position.set(x, y, z);
+  group.userData = { carX: x, carY: y, carZ: z, carTheta: theta, carSize: s };
+  scene.add(group);
+  return group;
+}
+
+// ============================================================
+// POLICE CAR
+// ============================================================
+function createPoliceCar(x, y, z, theta, s, stageNum) {
+  const group = new THREE.Group();
+
+  // Body (black body, white hood)
+  const bodyGeo = buildCarBodyGeometry(s, [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+  const bodyMat = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide });
+  const body = new THREE.Mesh(bodyGeo, bodyMat);
+  group.add(body);
+
+  // Siren lights on roof
+  const sirenLeft = new THREE.Mesh(
+    new THREE.PlaneGeometry(s / 2, s / 2),
+    new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.DoubleSide })
+  );
+  sirenLeft.rotation.x = -PI / 2;
+  sirenLeft.position.set(-s / 4, s + 0.1, s / 4);
+  group.add(sirenLeft);
+
+  const sirenRight = new THREE.Mesh(
+    new THREE.PlaneGeometry(s / 2, s / 2),
+    new THREE.MeshBasicMaterial({ color: 0x0000ff, side: THREE.DoubleSide })
+  );
+  sirenRight.rotation.x = -PI / 2;
+  sirenRight.position.set(-s / 4, s + 0.1, -s / 4);
+  group.add(sirenRight);
+
+  // Wheels
+  const wRL = createWheel(s);
+  wRL.position.set(-s / 2, 0, s / 1.9);
+  group.add(wRL);
+  const wRR = createWheel(s);
+  wRR.position.set(-s / 2, 0, -s / 1.9);
+  wRR.rotation.y = PI;
+  group.add(wRR);
+  const wFL = createWheel(s);
+  wFL.position.set(s / 1.5, 0, s / 1.9);
+  group.add(wFL);
+  const wFR = createWheel(s);
+  wFR.position.set(s / 1.5, 0, -s / 1.9);
+  wFR.rotation.y = PI;
+  group.add(wFR);
+
+  group.position.set(x, y, z);
+  group.userData = {
+    carX: x, carY: y, carZ: z, carTheta: theta, carSize: s,
+    velocity: POLICE_VELOCITY,
+    caught: false, bounce: 0, inPursuit: true, hit: false, dead: false,
+    stage: stageNum, r: 1, b: 0,
+    sirenLeft, sirenRight,
+  };
+  scene.add(group);
+  return group;
+}
+
+// ============================================================
+// MONEY CRATE
+// ============================================================
+function createMoneyCrate(x, y, z) {
+  const geo = new THREE.BoxGeometry(2, 2, 2);
+  const mat = new THREE.MeshLambertMaterial({ color: new THREE.Color(0.6, 0.4, 0.2) });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.set(x, y, z);
+  mesh.userData = { crateX: x, crateY: y, crateZ: z };
+  scene.add(mesh);
+  return mesh;
+}
+
+// ============================================================
+// MINIMAP MARKERS (simplified sphere representations)
+// ============================================================
+const minimapScene = new THREE.Scene();
+minimapScene.background = new THREE.Color(0x000000);
+
+// We'll add a duplicate ground for the minimap
+const minimapGroundTex = loadTex('carcarpetcity.png');
+minimapGroundTex.wrapS = THREE.RepeatWrapping;
+minimapGroundTex.wrapT = THREE.RepeatWrapping;
+const minimapGround = new THREE.Mesh(
+  new THREE.PlaneGeometry(BOUNDS * 2, BOUNDS * 2),
+  new THREE.MeshBasicMaterial({ map: minimapGroundTex, side: THREE.DoubleSide })
+);
+minimapGround.rotation.x = -PI / 2;
+minimapScene.add(minimapGround);
+
+// Simple skybox for minimap
+const minimapSkyGeo = new THREE.BoxGeometry(400, 400, 400);
+const minimapSkyMats = [
+  new THREE.MeshBasicMaterial({ map: loadTex('right.png'), side: THREE.BackSide }),
+  new THREE.MeshBasicMaterial({ map: loadTex('left.png'), side: THREE.BackSide }),
+  new THREE.MeshBasicMaterial({ map: loadTex('top.png'), side: THREE.BackSide }),
+  new THREE.MeshBasicMaterial({ map: loadTex('bottom.png'), side: THREE.BackSide }),
+  new THREE.MeshBasicMaterial({ map: loadTex('back.png'), side: THREE.BackSide }),
+  new THREE.MeshBasicMaterial({ map: loadTex('front.png'), side: THREE.BackSide }),
+];
+const minimapSky = new THREE.Mesh(minimapSkyGeo, minimapSkyMats);
+minimapScene.add(minimapSky);
+
+const minimapLight = new THREE.DirectionalLight(0xffffff, 1.0);
+minimapLight.position.set(10, 10, 10);
+minimapScene.add(minimapLight);
+minimapScene.add(new THREE.AmbientLight(0x222222));
+
+// Player marker (white sphere)
+const playerMarker = new THREE.Mesh(
+  new THREE.SphereGeometry(3, 10, 10),
+  new THREE.MeshBasicMaterial({ color: 0xffffff })
+);
+minimapScene.add(playerMarker);
+
+// Minimap marker pools (reuse objects to avoid GC pressure)
+const MARKER_POOL_SIZE = 50;
+const sharedSphereGeo = new THREE.SphereGeometry(3, 10, 10);
+const sharedCubeGeo10 = new THREE.BoxGeometry(10, 10, 10);
+const sharedCubeGeo11 = new THREE.BoxGeometry(11, 11, 11);
+
+const policeMarkerPool = [];
+const crateMarkerPool = [];
+for (let i = 0; i < MARKER_POOL_SIZE; i++) {
+  const pm = new THREE.Mesh(sharedSphereGeo, new THREE.MeshBasicMaterial({ color: 0x000000 }));
+  pm.visible = false;
+  minimapScene.add(pm);
+  policeMarkerPool.push(pm);
+
+  const cm = new THREE.Mesh(sharedCubeGeo10, new THREE.MeshBasicMaterial({ color: new THREE.Color(0.6, 0.4, 0.2) }));
+  cm.visible = false;
+  minimapScene.add(cm);
+  crateMarkerPool.push(cm);
+}
+
+function syncMinimapMarkers() {
+  // Hide all markers
+  policeMarkerPool.forEach(m => { m.visible = false; });
+  crateMarkerPool.forEach(m => { m.visible = false; });
+
+  // Show and position police markers
+  let pi = 0;
+  fuzz.forEach(cop => {
+    const d = cop.userData;
+    if (d.carY > -10 && pi < MARKER_POOL_SIZE) {
+      const marker = policeMarkerPool[pi++];
+      marker.visible = true;
+      marker.position.set(d.carX, d.carY, d.carZ);
+      if (d.inPursuit) {
+        marker.material.color.setRGB(d.r, 0, d.b);
+      } else {
+        marker.material.color.setRGB(0, 0, 0);
+      }
+    }
+  });
+
+  // Show and position crate markers (pulsing size matching original)
+  const cubeGeo = targSize <= 10 ? sharedCubeGeo10 : sharedCubeGeo11;
+  let ci = 0;
+  cash.forEach(crate => {
+    const d = crate.userData;
+    if (ci < MARKER_POOL_SIZE) {
+      const marker = crateMarkerPool[ci++];
+      marker.visible = true;
+      marker.geometry = cubeGeo;
+      marker.position.set(d.crateX, d.crateY, d.crateZ);
+    }
+  });
+}
+
+// ============================================================
+// INITIALIZE GAME OBJECTS
+// ============================================================
+const porsche = createPorsche(5, 0.5, 5, 0, 1);
+let cash = [];
+let fuzz = [];
+
+// ============================================================
+// CAMERA SETUP (matching original arcball parameters)
+// ============================================================
+// Main camera: radius=50, theta=-PI/2, phi=3*PI/4
+const mainCamParams = { radius: 50, theta: -PI / 2, phi: 3 * PI / 4 };
+// Overhead camera: radius=150, theta=-PI/2, phi=PI
+const overheadCamParams = { radius: 150, theta: -PI / 2, phi: PI };
+
+function updateArcballCamera(camera, params, atX, atY, atZ) {
+  const eyeX = params.radius * Math.sin(params.theta) * Math.sin(params.phi) + atX;
+  const eyeY = params.radius * (-Math.cos(params.phi)) + atY;
+  const eyeZ = params.radius * (-Math.cos(params.theta)) * Math.sin(params.phi) + atZ;
+  camera.position.set(eyeX, eyeY, eyeZ);
+  camera.lookAt(atX, atY, atZ);
+}
+
+// ============================================================
+// INPUT
+// ============================================================
+window.addEventListener('keydown', (e) => {
+  keysPressed[e.key.toLowerCase()] = true;
+  if (e.key === 'r' && gameOver) restartGame();
+});
+window.addEventListener('keyup', (e) => {
+  keysPressed[e.key.toLowerCase()] = false;
+});
+
+window.addEventListener('resize', () => {
+  windowWidth = window.innerWidth;
+  windowHeight = window.innerHeight;
+  mainCamera.aspect = windowWidth / windowHeight;
+  mainCamera.updateProjectionMatrix();
+  renderer.setSize(windowWidth, windowHeight);
+});
+
+// ============================================================
+// HUD UPDATE
+// ============================================================
+const scoreEl = document.getElementById('score-display');
+const healthEl = document.getElementById('health-display');
+const stageEl = document.getElementById('stage-display');
+const gameoverEl = document.getElementById('gameover-display');
+const finalScoreEl = document.getElementById('final-score');
+const minimapBorder = document.getElementById('minimap-border');
+
+function updateHUD() {
+  scoreEl.textContent = `SCORE: ${score}`;
+
+  if (!gameOver) {
+    healthEl.style.display = 'block';
+    const r = Math.min(1, healthR);
+    const g = Math.max(0, healthG);
+    healthEl.style.color = `rgb(${Math.floor(r * 255)},${Math.floor(g * 255)},0)`;
+    healthEl.textContent = `HEALTH: ${health}%`;
+  }
+
+  if (stageUp && !gameOver) {
+    stageEl.style.display = 'block';
+    stageEl.textContent = `STAGE ${stage}`;
+  } else {
+    stageEl.style.display = 'none';
+  }
+
+  if (gameOver) {
+    gameoverEl.style.display = 'block';
+    finalScoreEl.textContent = `SCORE: ${score}`;
+    healthEl.style.display = 'none';
+    minimapBorder.style.display = 'none';
+  }
+}
+
+// ============================================================
+// COLLISION HELPERS (matching original logic exactly)
+// ============================================================
+function boxCollide(ax, az, bx, bz, r) {
+  return (bx < ax + r) && (bx > ax - r) && (bz < az + r) && (bz > az - r);
+}
+
+function crateCollide(crateX, crateZ, px, pz) {
+  return (px < crateX + 2) && (px > crateX - 2) && (pz > crateZ - 2) && (pz < crateZ + 2);
+}
+
+function engagePursuit(copData, px, pz) {
+  const vX = copData.carX - px;
+  const vZ = copData.carZ - pz;
+  return Math.sqrt(vX * vX + vZ * vZ);
+}
+
+// ============================================================
+// POLICE AI: chase (matching original logic exactly)
+// ============================================================
+function policeChase(copData, targetX, targetZ) {
+  if (copData.inPursuit) {
+    const xH = -Math.cos(copData.carTheta * (PI / 180));
+    const zH = Math.sin(copData.carTheta * (PI / 180));
+    const vX = copData.carX - targetX;
+    const vZ = copData.carZ - targetZ;
+    const denom = Math.sqrt(vX * vX + vZ * vZ) * Math.sqrt(xH * xH + zH * zH);
+    let angle = denom === 0 ? NaN : Math.acos(Math.max(-1, Math.min(1, (xH * vX + vZ * zH) / denom)));
+    let isCorrect = isNaN(angle);
+
+    if (!isCorrect) {
+      const correct = angle * (180 / PI);
+      const xH2 = -Math.cos((copData.carTheta + correct) * (PI / 180));
+      const zH2 = Math.sin((copData.carTheta + correct) * (PI / 180));
+      const denom2 = Math.sqrt(vX * vX + vZ * vZ) * Math.sqrt(xH2 * xH2 + zH2 * zH2);
+      const newAngle = denom2 === 0 ? NaN : Math.acos(Math.max(-1, Math.min(1, (xH2 * vX + vZ * zH2) / denom2)));
+      if (isNaN(newAngle)) {
+        copData.carTheta += correct;
+      } else {
+        copData.carTheta -= correct;
+      }
+    }
+  }
+  if (!copData.caught && !copData.dead) {
+    copData.carX += Math.cos(-PI * copData.carTheta / 180.0) * copData.velocity;
+    copData.carZ += Math.sin(-PI * copData.carTheta / 180.0) * copData.velocity;
+  }
+}
+
+// ============================================================
+// SIREN ANIMATION
+// ============================================================
+function updateSiren(copData) {
+  if (copData.inPursuit) {
+    const temp = copData.r;
+    copData.r = copData.b;
+    copData.b = temp;
+  }
+  const sl = copData.sirenLeft;
+  const sr = copData.sirenRight;
+  sl.material.color.setRGB(copData.r, 0, copData.b);
+  sr.material.color.setRGB(copData.b, 0, copData.r);
+}
+
+// ============================================================
+// GAME TICK (matching original myTimer exactly)
+// ============================================================
+function gameTick() {
+  if (gameOver) return;
+
+  const pd = porsche.userData;
+
+  // Crate size pulsing (minimap cubes alternate between 10 and 11, matching original)
+  if (targSize <= 10) {
+    targSize = 11;
+  } else {
+    targSize = 10;
+  }
+
+  // Police AI & collisions
+  for (let i = 0; i < fuzz.length; i++) {
+    const ci = fuzz[i].userData;
+    policeChase(ci, pd.carX, pd.carZ);
+    updateSiren(ci);
+
+    for (let j = 0; j < fuzz.length; j++) {
+      if (i === j) continue;
+      const cj = fuzz[j].userData;
+      if (boxCollide(ci.carX, ci.carZ, cj.carX, cj.carZ, 5)) {
+        ci.carTheta = -1 * ci.carTheta;
+        ci.hit = true;
+        ci.inPursuit = false;
+      }
+      if (ci.hit === true) {
+        if (engagePursuit(ci, pd.carX, pd.carZ) < 10) {
+          ci.inPursuit = true;
+          ci.hit = false;
+        }
+      }
+    }
+
+    // Player-police collision
+    if (boxCollide(pd.carX, pd.carZ, ci.carX, ci.carZ, 2)) {
+      if (health > 0) {
+        ci.caught = true;
+        health--;
+        healthR += 0.01;
+        healthG -= 0.01;
+      } else {
+        gameOver = true;
+      }
+    }
+    if (!boxCollide(pd.carX, pd.carZ, ci.carX, ci.carZ, 2)) {
+      ci.caught = false;
+    }
+  }
+
+  // Player movement
+  let moveForward = true, moveBack = true;
+
+  if (keysPressed['a']) {
+    pd.carTheta += PLAYER_TURN_SPEED;
+  }
+  if (keysPressed['d']) {
+    pd.carTheta -= PLAYER_TURN_SPEED;
+  }
+
+  if ((pd.carX < BOUNDS) && (pd.carX > -BOUNDS) && (pd.carZ < BOUNDS) && (pd.carZ > -BOUNDS)) {
+    for (let i = 0; i < fuzz.length; i++) {
+      const ci = fuzz[i].userData;
+      if (boxCollide(ci.carX, ci.carZ,
+        pd.carX + Math.cos(-PI * pd.carTheta / 180.0) * 1.25,
+        pd.carZ + Math.sin(-PI * pd.carTheta / 180.0) * 1.35, 2)) {
+        moveForward = false;
+        break;
+      }
+      if (boxCollide(ci.carX, ci.carZ,
+        pd.carX - Math.cos(-PI * pd.carTheta / 180.0) * 1.25,
+        pd.carZ - Math.sin(-PI * pd.carTheta / 180.0) * 1.35, 2)) {
+        moveBack = false;
+        break;
+      }
+    }
+    if (keysPressed['w'] && moveForward) {
+      pd.carX += Math.cos(-PI * pd.carTheta / 180.0) * PLAYER_SPEED;
+      pd.carZ += Math.sin(-PI * pd.carTheta / 180.0) * PLAYER_SPEED;
+    }
+    if (keysPressed['s'] && moveBack) {
+      pd.carX -= Math.cos(-PI * pd.carTheta / 180.0) * PLAYER_SPEED;
+      pd.carZ -= Math.sin(-PI * pd.carTheta / 180.0) * PLAYER_SPEED;
+    }
+  } else {
+    // Falling off the edge
+    if (pd.carY > -210) {
+      pd.carY -= 10;
+    } else {
+      gameOver = true;
+    }
+  }
+
+  // Police boundary behavior
+  for (let i = 0; i < fuzz.length; i++) {
+    const ci = fuzz[i].userData;
+    if (!((ci.carX < BOUNDS) && (ci.carX > -BOUNDS) && (ci.carZ < BOUNDS) && (ci.carZ > -BOUNDS))) {
+      if (ci.stage === stage) {
+        ci.carTheta += 180;
+        ci.bounce++;
+      } else {
+        if (ci.carY > -200) {
+          ci.carY -= 25;
+        } else {
+          ci.dead = true;
+          ci.inPursuit = false;
+        }
+      }
+    }
+  }
+
+  // Crate collection
+  for (let i = cash.length - 1; i >= 0; i--) {
+    const cd = cash[i].userData;
+    if (crateCollide(cd.crateX, cd.crateZ, pd.carX, pd.carZ)) {
+      scene.remove(cash[i]);
+      cash.splice(i, 1);
+      score += 100;
+    }
+  }
+
+  // Stage advancement
+  if (cash.length === 0 && !stageUp) {
+    stage++;
+    stageUp = true;
+  }
+
+  if (stageUp) {
+    transition--;
+    if (transition === 0) {
+      stageUp = false;
+      transition = 30;
+      for (let i = 0; i < stage; i++) {
+        let x = Math.floor(Math.random() * (BOUNDS - 2));
+        let z = Math.floor(Math.random() * (BOUNDS - 2));
+        if (Math.random() < 0.5) x *= -1;
+        if (Math.random() < 0.5) z *= -1;
+
+        const cop = createPoliceCar(x, 0.5, z, 15, 1, stage);
+        fuzz.push(cop);
+
+        const crate = createMoneyCrate(x, 1, z);
+        cash.push(crate);
+      }
+    }
+  }
+
+  // Sync 3D positions from userData
+  porsche.position.set(pd.carX, pd.carY, pd.carZ);
+  porsche.rotation.y = pd.carTheta * PI / 180;
+
+  for (let i = 0; i < fuzz.length; i++) {
+    const ci = fuzz[i].userData;
+    fuzz[i].position.set(ci.carX, ci.carY, ci.carZ);
+    fuzz[i].rotation.y = ci.carTheta * PI / 180;
+  }
+
+  // Update minimap player marker
+  playerMarker.position.set(pd.carX, pd.carY, pd.carZ);
+}
+
+// ============================================================
+// RENDER LOOP
+// ============================================================
+let lastTick = 0;
+
+function animate(time) {
+  requestAnimationFrame(animate);
+
+  // Run game tick at 15 FPS
+  if (time - lastTick >= TICK_RATE) {
+    gameTick();
+    lastTick = time;
+  }
+
+  const pd = porsche.userData;
+
+  // Update main camera (arcball following player)
+  updateArcballCamera(mainCamera, mainCamParams, pd.carX, pd.carY, pd.carZ);
+
+  // Move skybox with camera to keep it centered
+  skybox.position.copy(mainCamera.position);
+
+  // Sync minimap markers
+  syncMinimapMarkers();
+
+  // Update overhead camera (always looks at map center 0,0,0 like original)
+  updateArcballCamera(overheadCamera, overheadCamParams, 0, 0, 0);
+
+  // Clear and render main view
+  renderer.clear();
+  renderer.setViewport(0, 0, windowWidth, windowHeight);
+  renderer.setScissor(0, 0, windowWidth, windowHeight);
+  renderer.setScissorTest(false);
+  renderer.render(scene, mainCamera);
+
+  // Render minimap (top-right 1/3, matching original viewport placement)
+  if (!gameOver) {
+    const mw = Math.floor(windowWidth / 3);
+    const mh = Math.floor(windowHeight / 3);
+    const mx = windowWidth - mw;
+    const my = windowHeight - mh;
+    renderer.setViewport(mx, my, mw, mh);
+    renderer.setScissor(mx, my, mw, mh);
+    renderer.setScissorTest(true);
+    renderer.clear(true, true, false); // clear color+depth for minimap region
+    renderer.render(minimapScene, overheadCamera);
+    renderer.setScissorTest(false);
+  }
+
+  updateHUD();
+}
+
+// ============================================================
+// RESTART
+// ============================================================
+function restartGame() {
+  // Remove all police and crates
+  fuzz.forEach(c => scene.remove(c));
+  cash.forEach(c => scene.remove(c));
+  fuzz = [];
+  cash = [];
+
+  // Reset player
+  const pd = porsche.userData;
+  pd.carX = 5; pd.carY = 0.5; pd.carZ = 5; pd.carTheta = 0;
+  porsche.position.set(5, 0.5, 5);
+  porsche.rotation.y = 0;
+
+  // Reset state
+  gameOver = false;
+  score = 0;
+  health = 100;
+  healthR = 0;
+  healthG = 1;
+  stage = 0;
+  stageUp = false;
+  transition = 30;
+  targSize = 10;
+
+  gameoverEl.style.display = 'none';
+  healthEl.style.display = 'block';
+  minimapBorder.style.display = 'block';
+}
+
+// ============================================================
+// START
+// ============================================================
+requestAnimationFrame(animate);
+</script>
+</body>
+</html>
