@@ -70,6 +70,246 @@ const PLAYER_TURN_SPEED = 20.0;
 const POLICE_VELOCITY = 0.75;
 
 // ============================================================
+// AUDIO SYSTEM (procedural Web Audio API)
+// ============================================================
+let audioCtx = null;
+let audioStarted = false;
+let engineOsc = null, engineGain = null;
+let sirenOsc = null, sirenGain = null;
+let sirenLfoOsc = null, sirenLfoGain = null;
+let musicGain = null;
+let musicPlaying = false;
+
+function initAudio() {
+  if (audioStarted) return;
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  audioStarted = true;
+
+  // --- Engine sound: low sawtooth, volume/pitch driven by movement ---
+  engineOsc = audioCtx.createOscillator();
+  engineGain = audioCtx.createGain();
+  const engineFilter = audioCtx.createBiquadFilter();
+  engineOsc.type = 'sawtooth';
+  engineOsc.frequency.value = 60;
+  engineFilter.type = 'lowpass';
+  engineFilter.frequency.value = 200;
+  engineFilter.Q.value = 5;
+  engineGain.gain.value = 0.06;
+  engineOsc.connect(engineFilter);
+  engineFilter.connect(engineGain);
+  engineGain.connect(audioCtx.destination);
+  engineOsc.start();
+
+  // --- Police siren: oscillator with LFO modulating frequency ---
+  sirenOsc = audioCtx.createOscillator();
+  sirenGain = audioCtx.createGain();
+  sirenLfoOsc = audioCtx.createOscillator();
+  sirenLfoGain = audioCtx.createGain();
+  sirenOsc.type = 'sine';
+  sirenOsc.frequency.value = 600;
+  sirenLfoOsc.type = 'sine';
+  sirenLfoOsc.frequency.value = 2; // wail speed
+  sirenLfoGain.gain.value = 300;   // frequency sweep range
+  sirenGain.gain.value = 0;        // starts silent
+  sirenLfoOsc.connect(sirenLfoGain);
+  sirenLfoGain.connect(sirenOsc.frequency);
+  sirenOsc.connect(sirenGain);
+  sirenGain.connect(audioCtx.destination);
+  sirenOsc.start();
+  sirenLfoOsc.start();
+
+  // --- Background music: simple procedural bass loop ---
+  startMusic();
+}
+
+// SFX: money pickup (ascending cha-ching)
+function playPickupSound() {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  const o1 = audioCtx.createOscillator();
+  const o2 = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o1.type = 'square'; o1.frequency.value = 880;
+  o2.type = 'square'; o2.frequency.value = 1320;
+  g.gain.setValueAtTime(0.12, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+  o1.connect(g); o2.connect(g); g.connect(audioCtx.destination);
+  o1.start(t); o2.start(t + 0.08);
+  o1.stop(t + 0.15); o2.stop(t + 0.3);
+}
+
+// SFX: collision hit (noise burst)
+function playHitSound() {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  const bufferSize = audioCtx.sampleRate * 0.1;
+  const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < bufferSize; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / bufferSize);
+  const noise = audioCtx.createBufferSource();
+  noise.buffer = buffer;
+  const g = audioCtx.createGain();
+  const f = audioCtx.createBiquadFilter();
+  f.type = 'bandpass'; f.frequency.value = 400; f.Q.value = 2;
+  g.gain.setValueAtTime(0.25, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
+  noise.connect(f); f.connect(g); g.connect(audioCtx.destination);
+  noise.start(t); noise.stop(t + 0.1);
+}
+
+// SFX: stage up (ascending fanfare)
+function playStageUpSound() {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  const notes = [523, 659, 784, 1047]; // C5 E5 G5 C6
+  notes.forEach((freq, i) => {
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = 'square';
+    o.frequency.value = freq;
+    g.gain.setValueAtTime(0.1, t + i * 0.12);
+    g.gain.exponentialRampToValueAtTime(0.001, t + i * 0.12 + 0.3);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(t + i * 0.12); o.stop(t + i * 0.12 + 0.3);
+  });
+}
+
+// SFX: game over (descending tones)
+function playGameOverSound() {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  const notes = [440, 370, 311, 233]; // A4 F#4 Eb4 Bb3
+  notes.forEach((freq, i) => {
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = 'sawtooth';
+    o.frequency.value = freq;
+    g.gain.setValueAtTime(0.1, t + i * 0.2);
+    g.gain.exponentialRampToValueAtTime(0.001, t + i * 0.2 + 0.4);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(t + i * 0.2); o.stop(t + i * 0.2 + 0.4);
+  });
+}
+
+// SFX: falling off edge (descending pitch whistle)
+let fallingPlaying = false;
+let fallingOsc = null, fallingGain = null;
+function startFallingSound() {
+  if (!audioCtx || fallingPlaying) return;
+  fallingPlaying = true;
+  const t = audioCtx.currentTime;
+  fallingOsc = audioCtx.createOscillator();
+  fallingGain = audioCtx.createGain();
+  fallingOsc.type = 'sine';
+  fallingOsc.frequency.setValueAtTime(800, t);
+  fallingOsc.frequency.exponentialRampToValueAtTime(80, t + 3);
+  fallingGain.gain.setValueAtTime(0.15, t);
+  fallingGain.gain.linearRampToValueAtTime(0, t + 3);
+  fallingOsc.connect(fallingGain); fallingGain.connect(audioCtx.destination);
+  fallingOsc.start(t); fallingOsc.stop(t + 3);
+  fallingOsc.onended = () => { fallingPlaying = false; };
+}
+function stopFallingSound() {
+  if (fallingOsc && fallingPlaying) {
+    try { fallingOsc.stop(); } catch(e) {}
+    fallingPlaying = false;
+  }
+}
+
+// Background music: looping bass/lead pattern
+function startMusic() {
+  if (!audioCtx || musicPlaying) return;
+  musicPlaying = true;
+  musicGain = audioCtx.createGain();
+  musicGain.gain.value = 0.06;
+  musicGain.connect(audioCtx.destination);
+
+  // Bass pattern (pentatonic minor, looping)
+  const bassNotes = [110, 131, 147, 165, 196, 165, 147, 131]; // Am pentatonic
+  const leadNotes = [440, 523, 587, 523, 440, 392, 440, 523];
+  const beatLen = 0.25; // seconds per beat
+  const loopLen = bassNotes.length * beatLen;
+
+  function scheduleLoop() {
+    if (!musicPlaying || !audioCtx) return;
+    const t = audioCtx.currentTime + 0.05;
+    for (let i = 0; i < bassNotes.length; i++) {
+      // Bass
+      const bo = audioCtx.createOscillator();
+      const bg = audioCtx.createGain();
+      bo.type = 'triangle';
+      bo.frequency.value = bassNotes[i];
+      bg.gain.setValueAtTime(0.08, t + i * beatLen);
+      bg.gain.exponentialRampToValueAtTime(0.001, t + i * beatLen + beatLen * 0.9);
+      bo.connect(bg); bg.connect(musicGain);
+      bo.start(t + i * beatLen); bo.stop(t + i * beatLen + beatLen * 0.95);
+
+      // Lead (quieter, square wave)
+      const lo = audioCtx.createOscillator();
+      const lg = audioCtx.createGain();
+      lo.type = 'square';
+      lo.frequency.value = leadNotes[i];
+      lg.gain.setValueAtTime(0.03, t + i * beatLen);
+      lg.gain.exponentialRampToValueAtTime(0.001, t + i * beatLen + beatLen * 0.8);
+      lo.connect(lg); lg.connect(musicGain);
+      lo.start(t + i * beatLen); lo.stop(t + i * beatLen + beatLen * 0.85);
+
+      // Hi-hat (noise tick every other beat)
+      if (i % 2 === 0) {
+        const hLen = 0.04;
+        const hBuf = audioCtx.createBuffer(1, audioCtx.sampleRate * hLen, audioCtx.sampleRate);
+        const hData = hBuf.getChannelData(0);
+        for (let j = 0; j < hData.length; j++) hData[j] = (Math.random() * 2 - 1) * (1 - j / hData.length);
+        const hn = audioCtx.createBufferSource();
+        hn.buffer = hBuf;
+        const hg = audioCtx.createGain();
+        const hf = audioCtx.createBiquadFilter();
+        hf.type = 'highpass'; hf.frequency.value = 8000;
+        hg.gain.setValueAtTime(0.08, t + i * beatLen);
+        hg.gain.exponentialRampToValueAtTime(0.001, t + i * beatLen + hLen);
+        hn.connect(hf); hf.connect(hg); hg.connect(musicGain);
+        hn.start(t + i * beatLen); hn.stop(t + i * beatLen + hLen);
+      }
+    }
+    setTimeout(scheduleLoop, loopLen * 1000 * 0.9);
+  }
+  scheduleLoop();
+}
+
+function stopMusic() {
+  musicPlaying = false;
+}
+
+// Update engine pitch/volume based on player movement
+function updateEngineSound(isMoving, speed) {
+  if (!engineOsc || !engineGain) return;
+  const targetFreq = isMoving ? 80 + speed * 40 : 55;
+  const targetVol = isMoving ? 0.09 : 0.04;
+  engineOsc.frequency.value += (targetFreq - engineOsc.frequency.value) * 0.15;
+  engineGain.gain.value += (targetVol - engineGain.gain.value) * 0.15;
+}
+
+// Update siren volume based on nearest pursuing cop distance
+function updateSirenSound(nearestDist, hasPursuers) {
+  if (!sirenGain) return;
+  if (hasPursuers && nearestDist < 60) {
+    const vol = Math.max(0, 0.08 * (1 - nearestDist / 60));
+    sirenGain.gain.value += (vol - sirenGain.gain.value) * 0.15;
+  } else {
+    sirenGain.gain.value *= 0.9;
+  }
+}
+
+// Start audio on first user interaction (browser autoplay policy)
+function onFirstInteraction() {
+  initAudio();
+  window.removeEventListener('keydown', onFirstInteraction);
+  window.removeEventListener('click', onFirstInteraction);
+}
+window.addEventListener('keydown', onFirstInteraction);
+window.addEventListener('click', onFirstInteraction);
+
+// ============================================================
 // GAME STATE
 // ============================================================
 let windowWidth = window.innerWidth;
@@ -661,15 +901,21 @@ function gameTick() {
     if (boxCollide(pd.carX, pd.carZ, ci.carX, ci.carZ, 2)) {
       if (health > 0) {
         ci.caught = true;
+        if (!ci._wasColliding) playHitSound();
+        ci._wasColliding = true;
         health--;
         healthR += 0.01;
         healthG -= 0.01;
       } else {
+        if (!gameOver) playGameOverSound();
         gameOver = true;
       }
+    } else {
+      ci._wasColliding = false;
     }
     if (!boxCollide(pd.carX, pd.carZ, ci.carX, ci.carZ, 2)) {
       ci.caught = false;
+      ci._wasColliding = false;
     }
   }
 
@@ -709,9 +955,11 @@ function gameTick() {
     }
   } else {
     // Falling off the edge
+    startFallingSound();
     if (pd.carY > -210) {
       pd.carY -= 10;
     } else {
+      if (!gameOver) playGameOverSound();
       gameOver = true;
     }
   }
@@ -741,6 +989,7 @@ function gameTick() {
       scene.remove(cash[i]);
       cash.splice(i, 1);
       score += 100;
+      playPickupSound();
     }
   }
 
@@ -748,6 +997,7 @@ function gameTick() {
   if (cash.length === 0 && !stageUp) {
     stage++;
     stageUp = true;
+    playStageUpSound();
   }
 
   if (stageUp) {
@@ -782,6 +1032,22 @@ function gameTick() {
 
   // Update minimap player marker
   playerMarker.position.set(pd.carX, pd.carY, pd.carZ);
+
+  // Update audio
+  const isMoving = keysPressed['w'] || keysPressed['s'];
+  updateEngineSound(isMoving, PLAYER_SPEED);
+
+  let nearestCopDist = Infinity;
+  let hasPursuers = false;
+  for (let i = 0; i < fuzz.length; i++) {
+    const ci = fuzz[i].userData;
+    if (ci.inPursuit && !ci.dead) {
+      hasPursuers = true;
+      const d = engagePursuit(ci, pd.carX, pd.carZ);
+      if (d < nearestCopDist) nearestCopDist = d;
+    }
+  }
+  updateSirenSound(nearestCopDist, hasPursuers);
 }
 
 // ============================================================
@@ -866,6 +1132,10 @@ function restartGame() {
   gameoverEl.style.display = 'none';
   healthEl.style.display = 'block';
   minimapBorder.style.display = 'block';
+
+  // Reset audio
+  stopFallingSound();
+  if (sirenGain) sirenGain.gain.value = 0;
 }
 
 // ============================================================
